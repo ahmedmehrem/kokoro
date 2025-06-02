@@ -1,10 +1,8 @@
-from typing import cast
+from typing import List, cast
 import torch
-from kokoro.pipeline import KPipeline
+from kokoro.pipeline import Duration, KPipeline, WordTiming
 
 SAMPLE_RATE = 22050
-HOP_LENGTH = 600
-FRAME_DURATION = HOP_LENGTH / SAMPLE_RATE
 
 
 def test_alignment_matrix():
@@ -13,14 +11,19 @@ def test_alignment_matrix():
     pipeline = KPipeline(lang_code="a")
     generator = pipeline(test_text, voice="af_heart")
 
-    for text, phonemes, audio, align_matrix in generator:
+    for text, phonemes, audio, words_timing in generator:
         text = cast(str, text)
         phonemes = cast(str, phonemes)
         audio = cast(torch.FloatTensor, audio)
-        align_matrix = cast(torch.FloatTensor, align_matrix)
-        num_phonemes = len(phonemes)
+        words_timing = cast(List[WordTiming], words_timing)
 
-        num_frames = align_matrix.shape[2]
+        print(words_timing)
 
-        assert num_phonemes == align_matrix.shape[1] - 2
-        assert num_frames * FRAME_DURATION == len(audio) / SAMPLE_RATE
+        total_words_timing = Duration.merge_all(
+            [timing.duration for timing in words_timing]
+        ).second()
+
+        audio_duration = len(audio) / SAMPLE_RATE
+
+        assert total_words_timing > 0
+        assert total_words_timing < audio_duration

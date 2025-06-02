@@ -1,4 +1,5 @@
-from typing import cast
+from __future__ import annotations
+from typing import cast, NamedTuple
 from .model import KModel
 from dataclasses import dataclass
 from huggingface_hub import hf_hub_download
@@ -36,6 +37,34 @@ LANG_CODES = dict(
     # pip install misaki[zh]
     z="Mandarin Chinese",
 )
+
+SAMPLE_RATE = 22050
+
+
+class Duration(NamedTuple):
+    start: float
+    end: float
+
+    def merge(self, d: Duration) -> Duration:
+        return Duration(self.start, d.end)
+
+    @staticmethod
+    def merge_all(durations: list[Duration]) -> Duration:
+        duration = durations[0]
+
+        for i in range(1, len(durations)):
+            duration = duration.merge(durations[i])
+
+        return duration
+
+    def second(self) -> float:
+        return self.end - self.start
+
+
+@dataclass
+class WordTiming:
+    word: str
+    duration: Duration
 
 
 class KPipeline:
@@ -280,7 +309,7 @@ class KPipeline:
         voice: str,
         speed: float = 1,
         model: Optional[KModel] = None,
-    ) -> Generator["KPipeline.Result", None, None]:
+    ) -> Generator[KPipeline.Result, None, None]:
         """Generate audio from either raw phonemes or pre-processed tokens.
 
         Args:
@@ -366,13 +395,30 @@ class KPipeline:
             right = left + space_dur
             i = j + (1 if t.whitespace else 0)
 
-    @dataclass
     class Result:
-        graphemes: str
-        phonemes: str
-        tokens: Optional[List[en.MToken]] = None
-        output: Optional[KModel.Output] = None
-        text_index: Optional[int] = None
+        def __init__(
+            self,
+            graphemes: str,
+            phonemes: str,
+            tokens: Optional[List[en.MToken]] = None,
+            output: Optional[KModel.Output] = None,
+            text_index: Optional[int] = None,
+        ) -> None:
+            self.graphemes = graphemes
+            self.phonemes = phonemes
+            self.output = output
+            self.tokens = tokens
+            self.text_index = text_index
+            self.words_timing = []
+
+            if self.output is not None:
+                clip_duration = len(self.output.audio) / SAMPLE_RATE
+                self.words_timing = self._calc_words_timing(
+                    cast(str, graphemes),
+                    cast(str, phonemes),
+                    self.output.align_matrix,
+                    clip_duration,
+                )
 
         @property
         def audio(self) -> Optional[torch.FloatTensor]:
@@ -382,19 +428,48 @@ class KPipeline:
         def pred_dur(self) -> Optional[torch.LongTensor]:
             return None if self.output is None else self.output.pred_dur
 
-        @property
-        def align_matrix(self) -> Optional[torch.FloatTensor]:
-            return None if self.output is None else self.output.align_matrix
+        def _calc_words_timing(
+            self,
+            text: str,
+            phonemes: str,
+            align_matrix: torch.FloatTensor,
+            duration: float,
+        ) -> list[WordTiming]:
+            durations = []
+            words = text.split()
+            words_phonemes = phonemes.split()
+            alignment = align_matrix[0][1:-1, :]
+            num_frames = alignment.shape[1]
+
+            words_timing = []
+
+            for i in range(alignment.shape[0]):
+                frame_indices = torch.where(alignment[i] > 0)[0]
+                start = frame_indices.min().item() / num_frames * duration
+                end = (frame_indices.max().item() + 1) / num_frames * duration
+                durations.append(Duration(start, end))
+
+            offset = 0
+
+            for i, phonemes in enumerate(words_phonemes):
+                num_phonemes = len(phonemes)
+                word_duration = Duration.merge_all(
+                    durations[offset : offset + num_phonemes]
+                )
+                words_timing.append(WordTiming(words[i], word_duration))
+                offset += num_phonemes + 1
+
+            return words_timing
 
         ### MARK: BEGIN BACKWARD COMPAT ###
         def __iter__(self):
             yield self.graphemes
             yield self.phonemes
             yield self.audio
-            yield self.align_matrix
+            yield self.words_timing
 
         def __getitem__(self, index):
-            return [self.graphemes, self.phonemes, self.audio, self.align_matrix][index]
+            return [self.graphemes, self.phonemes, self.audio, self.words_timing][index]
 
         def __len__(self):
             return 4
@@ -408,7 +483,7 @@ class KPipeline:
         speed: Union[float, Callable[[int], float]] = 1,
         split_pattern: Optional[str] = r"\n+",
         model: Optional[KModel] = None,
-    ) -> Generator["KPipeline.Result", None, None]:
+    ) -> Generator[KPipeline.Result, None, None]:
         model = model or self.model
         if model is None or voice is None:
             raise ValueError(
