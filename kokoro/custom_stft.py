@@ -1,8 +1,9 @@
-from attr import attr
+from typing import cast
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 
 class CustomSTFT(nn.Module):
     """
@@ -11,7 +12,7 @@ class CustomSTFT(nn.Module):
     - forward STFT => Real-part conv1d + Imag-part conv1d
     - inverse STFT => Real-part conv_transpose1d + Imag-part conv_transpose1d + sum
     - avoids F.unfold, so easier to export to ONNX
-    - uses replicate or constant padding for 'center=True' to approximate 'reflect' 
+    - uses replicate or constant padding for 'center=True' to approximate 'reflect'
       (reflect is not supported for dynamic shapes in ONNX)
     """
 
@@ -36,8 +37,10 @@ class CustomSTFT(nn.Module):
         self.freq_bins = self.n_fft // 2 + 1
 
         # Build window
-        assert window == 'hann', window
-        window_tensor = torch.hann_window(win_length, periodic=True, dtype=torch.float32)
+        assert window == "hann", window
+        window_tensor = torch.hann_window(
+            win_length, periodic=True, dtype=torch.float32
+        )
         if self.win_length < self.n_fft:
             # Zero-pad up to n_fft
             extra = self.n_fft - self.win_length
@@ -66,17 +69,13 @@ class CustomSTFT(nn.Module):
 
         # Register as Conv1d weight => (out_channels, in_channels, kernel_size)
         # out_channels = freq_bins, in_channels=1, kernel_size=n_fft
-        self.register_buffer(
-            "weight_forward_real", forward_real_torch.unsqueeze(1)
-        )
-        self.register_buffer(
-            "weight_forward_imag", forward_imag_torch.unsqueeze(1)
-        )
+        self.register_buffer("weight_forward_real", forward_real_torch.unsqueeze(1))
+        self.register_buffer("weight_forward_imag", forward_imag_torch.unsqueeze(1))
 
         # Precompute inverse DFT
         # Real iFFT formula => scale = 1/n_fft, doubling for bins 1..freq_bins-2 if n_fft even, etc.
-        # For simplicity, we won't do the "DC/nyquist not doubled" approach here. 
-        # If you want perfect real iSTFT, you can add that logic. 
+        # For simplicity, we won't do the "DC/nyquist not doubled" approach here.
+        # If you want perfect real iSTFT, you can add that logic.
         # This version just yields good approximate reconstruction with Hann + typical overlap.
         inv_scale = 1.0 / self.n_fft
         n = np.arange(self.n_fft)
@@ -97,8 +96,6 @@ class CustomSTFT(nn.Module):
         self.register_buffer(
             "weight_backward_imag", torch.from_numpy(backward_imag).float().unsqueeze(1)
         )
-        
-
 
     def transform(self, waveform: torch.Tensor):
         """
@@ -115,7 +112,7 @@ class CustomSTFT(nn.Module):
         # Convolution to get real part => shape (B, freq_bins, frames)
         real_out = F.conv1d(
             x,
-            self.weight_forward_real,
+            cast(torch.FloatTensor, self.weight_forward_real),
             bias=None,
             stride=self.hop_length,
             padding=0,
@@ -123,7 +120,7 @@ class CustomSTFT(nn.Module):
         # Imag part
         imag_out = F.conv1d(
             x,
-            self.weight_forward_imag,
+            cast(torch.FloatTensor, self.weight_forward_imag),
             bias=None,
             stride=self.hop_length,
             padding=0,
@@ -137,7 +134,6 @@ class CustomSTFT(nn.Module):
         correction_mask = (imag_out == 0) & (real_out < 0)
         phase[correction_mask] = torch.pi
         return magnitude, phase
-
 
     def inverse(self, magnitude: torch.Tensor, phase: torch.Tensor, length=None):
         """
@@ -159,14 +155,16 @@ class CustomSTFT(nn.Module):
         # then add them => (B, 1, time).
         real_rec = F.conv_transpose1d(
             real_part,
-            self.weight_backward_real,  # shape (freq_bins, 1, filter_length)
+            cast(
+                torch.FloatTensor, self.weight_backward_real
+            ),  # shape (freq_bins, 1, filter_length)
             bias=None,
             stride=self.hop_length,
             padding=0,
         )
         imag_rec = F.conv_transpose1d(
             imag_part,
-            self.weight_backward_imag,
+            cast(torch.FloatTensor, self.weight_backward_imag),
             bias=None,
             stride=self.hop_length,
             padding=0,
