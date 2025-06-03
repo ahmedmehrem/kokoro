@@ -1,4 +1,5 @@
 from typing import List, cast
+import soundfile as sf
 import torch
 from kokoro.pipeline import Duration, KPipeline, WordTiming
 
@@ -11,11 +12,13 @@ def test_alignment_matrix():
     pipeline = KPipeline(lang_code="a")
     generator = pipeline(test_text, voice="af_heart")
 
-    for text, phonemes, audio, words_timing in generator:
+    for text, phonemes, audio, words_timing, _ in generator:
         text = cast(str, text)
         phonemes = cast(str, phonemes)
         audio = cast(torch.FloatTensor, audio)
         words_timing = cast(List[WordTiming], words_timing)
+
+        sf.write("output.wav", audio.numpy(), SAMPLE_RATE)
 
         print(words_timing)
 

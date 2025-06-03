@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import cast, NamedTuple
+from typing import cast, NamedTuple, Dict
 from .model import KModel
 from dataclasses import dataclass
 from huggingface_hub import hf_hub_download
@@ -305,7 +305,7 @@ class KPipeline:
 
     def generate_from_tokens(
         self,
-        tokens: Union[str, List[en.MToken]],
+        tokens: Union[str, Dict[str, List[en.MToken]]],
         voice: str,
         speed: float = 1,
         model: Optional[KModel] = None,
@@ -342,8 +342,13 @@ class KPipeline:
             return
 
         logger.debug("Processing MTokens")
+
+        all_tokens: List[en.MToken] = []
+
+        for _, phonemes in tokens.items():
+            all_tokens.extend(phonemes)
         # Handle pre-processed tokens
-        for gs, ps, tks in self.en_tokenize(tokens):
+        for gs, ps, tks in self.en_tokenize(all_tokens):
             if not ps:
                 continue
             elif len(ps) > 510:
@@ -355,7 +360,7 @@ class KPipeline:
             output = KPipeline.infer(model, ps, pack, speed) if model else None
             if output is not None and output.pred_dur is not None:
                 KPipeline.join_timestamps(tks, output.pred_dur)
-            yield self.Result(graphemes=gs, phonemes=ps, tokens=tks, output=output)
+            yield self.Result(graphemes=gs, phonemes=ps, tokens=tokens, output=output)
 
     @staticmethod
     def join_timestamps(tokens: List[en.MToken], pred_dur: torch.LongTensor):
@@ -395,12 +400,28 @@ class KPipeline:
             right = left + space_dur
             i = j + (1 if t.whitespace else 0)
 
+    def get_phonemes(self, input_text: str) -> Tuple[str, Dict[str, List[en.MToken]]]:
+        words = input_text.split()
+        tokens: Dict[str, List[en.MToken]] = {}
+        all_phonemes = ""
+
+        for word in words:
+            phonemes, word_tokens = self.g2p(word)
+
+            if word_tokens is None:
+                continue
+
+            tokens[word] = word_tokens
+            all_phonemes += word
+
+        return all_phonemes, tokens
+
     class Result:
         def __init__(
             self,
             graphemes: str,
             phonemes: str,
-            tokens: Optional[List[en.MToken]] = None,
+            tokens: Optional[Dict[str, List[en.MToken]]] = None,
             output: Optional[KModel.Output] = None,
             text_index: Optional[int] = None,
         ) -> None:
@@ -409,16 +430,42 @@ class KPipeline:
             self.output = output
             self.tokens = tokens
             self.text_index = text_index
-            self.words_timing = []
+            self.words_timing: List[WordTiming] = []
 
-            if self.output is not None:
-                clip_duration = len(self.output.audio) / SAMPLE_RATE
-                self.words_timing = self._calc_words_timing(
-                    cast(str, graphemes),
-                    cast(str, phonemes),
-                    self.output.align_matrix,
-                    clip_duration,
+            durations = []
+
+            if self.tokens is None:
+                return
+
+            if self.output is None:
+                return
+
+            clip_duration = len(self.output.audio) / SAMPLE_RATE
+            alignment = self.output.align_matrix[0][1:-1, :]
+            num_frames = alignment.shape[1]
+
+            for i in range(alignment.shape[0]):
+                frame_indices = torch.where(alignment[i] > 0)[0]
+                start = frame_indices.min().item() / num_frames * clip_duration
+                end = (frame_indices.max().item() + 1) / num_frames * clip_duration
+                durations.append(Duration(start, end))
+
+            offset = 0
+
+            for word, word_tokens in self.tokens.items():
+                num_phonemes = 0
+
+                for token in word_tokens:
+                    if token.phonemes is None:
+                        continue
+                    num_phonemes += len(token.phonemes)
+
+                word_duration = Duration.merge_all(
+                    durations[offset : offset + num_phonemes]
                 )
+
+                self.words_timing.append(WordTiming(word, word_duration))
+                offset += num_phonemes + 1
 
         @property
         def audio(self) -> Optional[torch.FloatTensor]:
@@ -428,51 +475,25 @@ class KPipeline:
         def pred_dur(self) -> Optional[torch.LongTensor]:
             return None if self.output is None else self.output.pred_dur
 
-        def _calc_words_timing(
-            self,
-            text: str,
-            phonemes: str,
-            align_matrix: torch.FloatTensor,
-            duration: float,
-        ) -> list[WordTiming]:
-            durations = []
-            words = text.split()
-            words_phonemes = phonemes.split()
-            alignment = align_matrix[0][1:-1, :]
-            num_frames = alignment.shape[1]
-
-            words_timing = []
-
-            for i in range(alignment.shape[0]):
-                frame_indices = torch.where(alignment[i] > 0)[0]
-                start = frame_indices.min().item() / num_frames * duration
-                end = (frame_indices.max().item() + 1) / num_frames * duration
-                durations.append(Duration(start, end))
-
-            offset = 0
-
-            for i, phonemes in enumerate(words_phonemes):
-                num_phonemes = len(phonemes)
-                word_duration = Duration.merge_all(
-                    durations[offset : offset + num_phonemes]
-                )
-                words_timing.append(WordTiming(words[i], word_duration))
-                offset += num_phonemes + 1
-
-            return words_timing
-
         ### MARK: BEGIN BACKWARD COMPAT ###
         def __iter__(self):
             yield self.graphemes
             yield self.phonemes
             yield self.audio
             yield self.words_timing
+            yield self.pred_dur
 
         def __getitem__(self, index):
-            return [self.graphemes, self.phonemes, self.audio, self.words_timing][index]
+            return [
+                self.graphemes,
+                self.phonemes,
+                self.audio,
+                self.words_timing,
+                self.pred_dur,
+            ][index]
 
         def __len__(self):
-            return 4
+            return 5
 
         #### MARK: END BACKWARD COMPAT ####
 
@@ -506,12 +527,14 @@ class KPipeline:
                 logger.debug(
                     f"Processing English text: {graphemes[:50]}{'...' if len(graphemes) > 50 else ''}"
                 )
-                _, tokens = self.g2p(graphemes)
+                phonemes, words_tokens = self.get_phonemes(graphemes)
 
-                if tokens is None:
-                    continue
+                all_tokens: List[en.MToken] = []
 
-                for gs, ps, tks in self.en_tokenize(tokens):
+                for _, phonemes in words_tokens.items():
+                    all_tokens.extend(phonemes)
+
+                for gs, ps, tks in self.en_tokenize(all_tokens):
                     if not ps:
                         continue
                     elif len(ps) > 510:
@@ -528,7 +551,7 @@ class KPipeline:
                     yield self.Result(
                         graphemes=gs,
                         phonemes=ps,
-                        tokens=tks,
+                        tokens=words_tokens,
                         output=output,
                         text_index=graphemes_index,
                     )
@@ -572,7 +595,8 @@ class KPipeline:
                     if not chunk.strip():
                         continue
 
-                    ps, _ = self.g2p(chunk)
+                    ps, words_phonemes = self.get_phonemes(chunk)
+
                     if not ps:
                         continue
                     elif len(ps) > 510:
@@ -583,6 +607,7 @@ class KPipeline:
                     yield self.Result(
                         graphemes=chunk,
                         phonemes=ps,
+                        tokens=words_phonemes,
                         output=output,
                         text_index=graphemes_index,
                     )
