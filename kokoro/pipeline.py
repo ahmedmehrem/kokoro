@@ -460,10 +460,12 @@ class KPipeline:
                         continue
                     num_phonemes += len(token.phonemes)
 
-                word_duration = Duration.merge_all(
-                    durations[offset : offset + num_phonemes]
-                )
+                word_durations = durations[offset : offset + num_phonemes]
 
+                if len(word_durations) == 0:
+                    continue
+
+                word_duration = Duration.merge_all(word_durations)
                 self.words_timing.append(WordTiming(word, word_duration))
                 offset += num_phonemes + 1
 
