@@ -3,7 +3,7 @@ import soundfile as sf
 import torch
 from kokoro.pipeline import Duration, KPipeline, WordTiming
 
-SAMPLE_RATE = 22050
+SAMPLE_RATE = 24000
 
 
 def test_alignment_matrix():

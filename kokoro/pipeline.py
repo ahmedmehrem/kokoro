@@ -38,7 +38,7 @@ LANG_CODES = dict(
     z="Mandarin Chinese",
 )
 
-SAMPLE_RATE = 22050
+SAMPLE_RATE = 24000
 
 
 class Duration(NamedTuple):
