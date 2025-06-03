@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import cast, NamedTuple, Dict
+from typing import cast, NamedTuple
 from .model import KModel
 from dataclasses import dataclass
 from huggingface_hub import hf_hub_download
@@ -59,6 +59,9 @@ class Duration(NamedTuple):
 
     def second(self) -> float:
         return self.end - self.start
+
+    def add(self, offset: float) -> Duration:
+        return Duration(self.start + offset, self.end + offset)
 
 
 @dataclass
@@ -305,7 +308,7 @@ class KPipeline:
 
     def generate_from_tokens(
         self,
-        tokens: Union[str, Dict[str, List[en.MToken]]],
+        tokens: Union[str, List[en.MToken]],
         voice: str,
         speed: float = 1,
         model: Optional[KModel] = None,
@@ -338,17 +341,14 @@ class KPipeline:
             if len(tokens) > 510:
                 raise ValueError(f"Phoneme string too long: {len(tokens)} > 510")
             output = KPipeline.infer(model, tokens, pack, speed) if model else None
-            yield self.Result(graphemes="", phonemes=tokens, output=output)
+            yield self.Result(offset=0, graphemes="", phonemes=tokens, output=output)
             return
 
         logger.debug("Processing MTokens")
 
-        all_tokens: List[en.MToken] = []
-
-        for _, phonemes in tokens.items():
-            all_tokens.extend(phonemes)
+        clip_offset = 0
         # Handle pre-processed tokens
-        for gs, ps, tks in self.en_tokenize(all_tokens):
+        for gs, ps, tks in self.en_tokenize(tokens):
             if not ps:
                 continue
             elif len(ps) > 510:
@@ -360,7 +360,15 @@ class KPipeline:
             output = KPipeline.infer(model, ps, pack, speed) if model else None
             if output is not None and output.pred_dur is not None:
                 KPipeline.join_timestamps(tks, output.pred_dur)
-            yield self.Result(graphemes=gs, phonemes=ps, tokens=tokens, output=output)
+            result = self.Result(
+                offset=clip_offset,
+                graphemes=gs,
+                phonemes=ps,
+                tokens=tks,
+                output=output,
+            )
+            clip_offset += result.clip_duration
+            yield result
 
     @staticmethod
     def join_timestamps(tokens: List[en.MToken], pred_dur: torch.LongTensor):
@@ -400,9 +408,9 @@ class KPipeline:
             right = left + space_dur
             i = j + (1 if t.whitespace else 0)
 
-    def get_phonemes(self, input_text: str) -> Tuple[str, Dict[str, List[en.MToken]]]:
+    def get_phonemes(self, input_text: str) -> Tuple[str, List[en.MToken]]:
         words = input_text.split()
-        tokens: Dict[str, List[en.MToken]] = {}
+        tokens: List[en.MToken] = []
         all_phonemes = ""
 
         for word in words:
@@ -411,8 +419,8 @@ class KPipeline:
             if word_tokens is None:
                 continue
 
-            tokens[word] = word_tokens
-            all_phonemes += word
+            tokens.extend(word_tokens)
+            all_phonemes += phonemes
 
         return all_phonemes, tokens
 
@@ -421,7 +429,8 @@ class KPipeline:
             self,
             graphemes: str,
             phonemes: str,
-            tokens: Optional[Dict[str, List[en.MToken]]] = None,
+            offset: float,
+            tokens: Optional[List[en.MToken]] = None,
             output: Optional[KModel.Output] = None,
             text_index: Optional[int] = None,
         ) -> None:
@@ -430,6 +439,7 @@ class KPipeline:
             self.output = output
             self.tokens = tokens
             self.text_index = text_index
+            self.offset = offset
             self.words_timing: List[WordTiming] = []
 
             durations = []
@@ -440,34 +450,32 @@ class KPipeline:
             if self.output is None:
                 return
 
-            clip_duration = len(self.output.audio) / SAMPLE_RATE
+            self.clip_duration = len(self.output.audio) / SAMPLE_RATE
+
             alignment = self.output.align_matrix[0][1:-1, :]
             num_frames = alignment.shape[1]
 
             for i in range(alignment.shape[0]):
                 frame_indices = torch.where(alignment[i] > 0)[0]
-                start = frame_indices.min().item() / num_frames * clip_duration
-                end = (frame_indices.max().item() + 1) / num_frames * clip_duration
-                durations.append(Duration(start, end))
+                start = frame_indices.min().item() / num_frames * self.clip_duration
+                end = (frame_indices.max().item() + 1) / num_frames * self.clip_duration
+                durations.append(Duration(start, end).add(self.offset))
 
             offset = 0
 
-            for word, word_tokens in self.tokens.items():
-                num_phonemes = 0
+            for word_tokens in self.tokens:
+                if word_tokens.phonemes is None:
+                    continue
 
-                for token in word_tokens:
-                    if token.phonemes is None:
-                        continue
-                    num_phonemes += len(token.phonemes)
-
+                num_phonemes = len(word_tokens.phonemes)
                 word_durations = durations[offset : offset + num_phonemes]
 
                 if len(word_durations) == 0:
                     continue
 
                 word_duration = Duration.merge_all(word_durations)
-                self.words_timing.append(WordTiming(word, word_duration))
-                offset += num_phonemes + 1
+                self.words_timing.append(WordTiming(word_tokens.text, word_duration))
+                offset += num_phonemes
 
         @property
         def audio(self) -> Optional[torch.FloatTensor]:
@@ -519,6 +527,7 @@ class KPipeline:
         if isinstance(text, str):
             text = re.split(split_pattern, text.strip()) if split_pattern else [text]
 
+        clip_offset = 0
         # Process each segment
         for graphemes_index, graphemes in enumerate(text):
             if not graphemes.strip():  # Skip empty segments
@@ -529,14 +538,9 @@ class KPipeline:
                 logger.debug(
                     f"Processing English text: {graphemes[:50]}{'...' if len(graphemes) > 50 else ''}"
                 )
-                phonemes, words_tokens = self.get_phonemes(graphemes)
+                _, words_tokens = self.get_phonemes(graphemes)
 
-                all_tokens: List[en.MToken] = []
-
-                for _, phonemes in words_tokens.items():
-                    all_tokens.extend(phonemes)
-
-                for gs, ps, tks in self.en_tokenize(all_tokens):
+                for gs, ps, tks in self.en_tokenize(words_tokens):
                     if not ps:
                         continue
                     elif len(ps) > 510:
@@ -550,13 +554,16 @@ class KPipeline:
                     if output is not None and output.pred_dur is not None:
                         KPipeline.join_timestamps(tks, output.pred_dur)
 
-                    yield self.Result(
+                    result = self.Result(
+                        offset=clip_offset,
                         graphemes=gs,
                         phonemes=ps,
-                        tokens=words_tokens,
+                        tokens=tks,
                         output=output,
                         text_index=graphemes_index,
                     )
+                    clip_offset += result.clip_duration
+                    yield result
 
             # Non-English processing with chunking
             else:
@@ -597,7 +604,7 @@ class KPipeline:
                     if not chunk.strip():
                         continue
 
-                    ps, words_phonemes = self.get_phonemes(chunk)
+                    ps, words_tokens = self.get_phonemes(chunk)
 
                     if not ps:
                         continue
@@ -606,10 +613,13 @@ class KPipeline:
                         ps = ps[:510]
 
                     output = KPipeline.infer(model, ps, pack, speed) if model else None
-                    yield self.Result(
+                    result = self.Result(
+                        offset=clip_offset,
                         graphemes=chunk,
                         phonemes=ps,
-                        tokens=words_phonemes,
+                        tokens=words_tokens,
                         output=output,
                         text_index=graphemes_index,
                     )
+                    clip_offset += result.clip_duration
+                    yield result
